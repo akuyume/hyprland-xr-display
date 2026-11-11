@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+"""Manage the Hyprland XR session, stereo settings, and individual windows."""
+import argparse
+import configparser
+from contextlib import contextmanager
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+SERVICE = "xr-hyprland.service"
+CONTROL = str(Path.home() / ".local/bin/xr-hyprlandctl")
+
+
+def run(*args, **kwargs):
+    kwargs.setdefault("timeout", 15)
+    return subprocess.run(args, check=True, text=True, **kwargs)
+
+
+def query(name):
+    return json.loads(run("hyprctl", "-j", name, capture_output=True).stdout)
+
+
+def dispatch(expression):
+    result = run("hyprctl", "dispatch", expression, capture_output=True).stdout.strip()
+    if result != "ok":
+        raise RuntimeError(result)
+
+
+def lua_string(value):
+    marker = "="
+    while "]" + marker + "]" in value:
+        marker += "="
+    return "[" + marker + "[" + value + "]" + marker + "]"
+
+
+def config_path():
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "xr-hyprland/config.ini"
+
+
+def configuration():
+    config = configparser.ConfigParser(inline_comment_prefixes=("#",))
+    config.read_string("[xr]\n" + config_path().read_text())
+    return config["xr"]
+
+
+def atomic_write(path, text, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as file:
+            temporary = Path(file.name)
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        temporary.chmod(mode)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def set_config(key, value):
+    path = config_path()
+    lines = [line for line in path.read_text().splitlines()
+             if line.split("=", 1)[0].strip() != key]
+    lines.append(f"{key}={value}")
+    atomic_write(path, "\n".join(lines) + "\n", path.stat().st_mode & 0o777)
+
+
+@contextmanager
+def state_transaction():
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    path = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "xr-hyprland/windows.json"
+    with (runtime / "xr-hyprland-windows.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = json.loads(path.read_text()) if path.exists() else {}
+        if not isinstance(state, dict):
+            raise ValueError("Invalid XR window state")
+        state.setdefault("version", 1)
+        state.setdefault("windows", {})
+        state.setdefault("placements", {})
+        if state["version"] != 1 or not isinstance(state["windows"], dict) or not isinstance(state["placements"], dict):
+            raise ValueError("Unsupported XR window state")
+        yield state
+        atomic_write(path, json.dumps(state, indent=2) + "\n")
+
+
+def save_windows(state):
+    path = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "xr-hyprland/windows.json"
+    atomic_write(path, json.dumps(state, indent=2) + "\n")
+
+
+def window_state():
+    path = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "xr-hyprland/windows.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def regular_monitors(monitors):
+    config = configuration()
+    override = config.get("target_output_name_override", "")
+    return [monitor for monitor in monitors
+            if monitor["name"] != override and monitor.get("make") not in ("Nreal", "XREAL")
+            and monitor.get("physicalWidth", 0) > 0 and monitor.get("physicalHeight", 0) > 0]
+
+
+def workspace_selector(workspace):
+    return str(workspace["id"]) if workspace["id"] > 0 else lua_string("name:" + workspace["name"])
+
+
+def create_desktop_output(name, original):
+    result = run("hyprctl", "output", "create", "headless", name, capture_output=True).stdout.strip()
+    if result != "ok":
+        raise RuntimeError(result)
+    mode = f'{original["width"]}x{original["height"]}@60'
+    # These are runtime rules for owned headless outputs, never physical ones.
+    expression = (f'hl.monitor({{output={lua_string(name)},mode={lua_string(mode)},position="auto",'
+                  f'scale={original["scale"]},transform={original.get("transform", 0)},'
+                  'reserved_area=0})')
+    result = run("hyprctl", "eval", expression, capture_output=True).stdout.strip()
+    if result != "ok":
+        raise RuntimeError(result)
+    deadline = time.monotonic() + 3
+    custom = [0, 0, 0, 0]
+    stable = None
+    while time.monotonic() < deadline:
+        output = next((m for m in query("monitors") if m["name"] == name), None)
+        if output and output["width"] == original["width"] and output["height"] == original["height"] and output["scale"] == original["scale"]:
+            difference = [wanted - actual for wanted, actual in zip(original.get("reserved", [0, 0, 0, 0]), output.get("reserved", [0, 0, 0, 0]))]
+            if any(difference):
+                # Bars may also appear on the virtual output. Copy the total
+                # reserved area, accounting for those bars rather than doubling it.
+                custom = [value + delta for value, delta in zip(custom, difference)]
+                left, top, right, bottom = custom
+                expression = (f'hl.monitor({{output={lua_string(name)},reserved_area='
+                              f'{{left={left},top={top},right={right},bottom={bottom}' + '}})')
+                result = run("hyprctl", "eval", expression, capture_output=True).stdout.strip()
+                if result != "ok":
+                    raise RuntimeError(result)
+                stable = None
+            elif stable is None:
+                stable = time.monotonic()
+            elif time.monotonic() - stable >= .25:
+                return output
+        time.sleep(.05)
+    raise RuntimeError("Virtual monitor did not acquire its native desktop mode")
+
+
+def prepare():
+    cleanup()
+    if configuration().get("view_mode", "desktop") == "windows":
+        with state_transaction() as state:
+            state["pending_desktop"] = {
+                "monitors": regular_monitors(query("monitors")),
+                "focused": query("activewindow").get("address")}
+
+
+def gather_desktop():
+    with state_transaction() as state:
+        if state.get("desktop", {}).get("outputs"):
+            return state["desktop"]["generation"]
+        outputs = query("monitors")
+        pending = state.get("pending_desktop", {})
+        regular = pending.get("monitors", regular_monitors(outputs))
+        if not regular:
+            return None
+        current = {m["name"]: m for m in outputs}
+        if any(m["name"] not in current or monitor_identity(current[m["name"]]) != monitor_identity(m) for m in regular):
+            raise RuntimeError("A desktop monitor changed during XR startup")
+        # Keep the highest-resolution display in front, with the other desktop
+        # coordinates preserved around it. Include only visible workspaces.
+        anchor = max(regular, key=lambda m: m["width"] * m["height"] / m["scale"]**2)
+        prefix = configuration().get("virtual_output_name", "XR-VIRTUAL")[:40]
+        planned = {f'{prefix}-desktop-{monitor["id"]}': {
+            "original": monitor, "workspace": monitor["activeWorkspace"], "id": None}
+            for monitor in regular}
+        if set(planned) & {m["name"] for m in outputs}:
+            raise RuntimeError("A desktop virtual-output name is already in use")
+        generation = uuid.uuid4().hex
+        desktop = {"generation": generation, "phase": "preparing", "anchor": anchor,
+                   "focused": pending.get("focused", query("activewindow").get("address")), "outputs": planned}
+        state["desktop"] = desktop
+        state.pop("pending_desktop", None)
+        for window in inventory():
+            if any(window["monitor"] == monitor["id"] and window["workspace"]["id"] == monitor["activeWorkspace"]["id"] for monitor in regular):
+                state["placements"].pop(window["identifier"], None)
+        save_windows(state)
+        for name, saved in planned.items():
+            output = create_desktop_output(name, saved["original"])
+            saved["id"] = output["id"]
+            save_windows(state)
+        # Configuring a new output re-evaluates workspace monitor rules. Finish
+        # configuring every clone before moving any of the real workspaces.
+        time.sleep(.2)
+        for name, saved in planned.items():
+            workspace = workspace_selector(saved["workspace"])
+            dispatch(f'hl.dsp.workspace.move({{workspace={workspace},monitor={lua_string(name)}}})')
+            dispatch(f'hl.dsp.focus({{workspace={workspace}}})')
+        desktop["phase"] = "ready"
+        save_windows(state)
+        if desktop["focused"] and any(c["address"] == desktop["focused"] for c in query("clients")):
+            focus_window(desktop["focused"])
+        return generation
+
+
+def restore_desktop():
+    with state_transaction() as state:
+        state.pop("pending_desktop", None)
+        desktop = state.get("desktop", {})
+        saved_outputs = desktop.get("outputs", {})
+        if not saved_outputs:
+            return
+        current = {m["name"]: m for m in query("monitors")}
+        workspaces = {w["id"]: w for w in query("workspaces")}
+        failures = []
+        for name, saved in list(saved_outputs.items()):
+            original = saved["original"]
+            physical = current.get(original["name"])
+            clone = current.get(name)
+            try:
+                if physical is None or monitor_identity(physical) != monitor_identity(original):
+                    raise RuntimeError(f'Original monitor {original["name"]} unavailable; keeping its virtual workspace')
+                if clone and (clone.get("physicalWidth", 0) or clone.get("make") or (saved["id"] is not None and clone["id"] != saved["id"])):
+                    raise RuntimeError("Refusing to remove an unrelated output: " + name)
+                workspace = workspace_selector(saved["workspace"])
+                if saved["workspace"]["id"] in workspaces:
+                    dispatch(f'hl.dsp.workspace.move({{workspace={workspace},monitor={lua_string(original["name"])}}})')
+                    dispatch(f'hl.dsp.focus({{workspace={workspace}}})')
+                if clone:
+                    # Also preserve workspaces the user opened on the clone.
+                    for extra in workspaces.values():
+                        if extra.get("monitorID") == clone["id"] and extra["id"] != saved["workspace"]["id"]:
+                            dispatch(f'hl.dsp.workspace.move({{workspace={workspace_selector(extra)},monitor={lua_string(original["name"])}}})')
+                    run("hyprctl", "output", "remove", name, capture_output=True)
+                del saved_outputs[name]
+                save_windows(state)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                failures.append(str(error))
+        if not saved_outputs:
+            focused = desktop.get("focused")
+            state.pop("desktop", None)
+            if focused and any(c["address"] == focused for c in query("clients")):
+                dispatch(f'hl.dsp.focus({{window={lua_string("address:" + focused)}}})')
+        if failures:
+            raise RuntimeError("; ".join(failures))
+
+
+def service_properties():
+    text = run("systemctl", "--user", "show", SERVICE, "--property=ActiveState,SubState,StatusText", capture_output=True).stdout
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def enter():
+    service = service_properties()
+    if service.get("StatusText") != "XR display ready":
+        return  # Preview sessions never transfer workspaces or blank monitors.
+    if configuration().get("view_mode", "desktop") == "windows":
+        generation = gather_desktop()
+        if generation:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                service = service_properties()
+                if service.get("StatusText") == "XR desktop ready:" + generation:
+                    break
+                if service.get("ActiveState") not in ("activating", "active"):
+                    raise RuntimeError("XR stopped during desktop transfer")
+                time.sleep(.1)
+            else:
+                raise RuntimeError("XR desktop captures did not become ready; restoring the desktop")
+    monitors_off()
+
+
+def active():
+    return subprocess.run(["systemctl", "--user", "is-active", "--quiet", SERVICE], timeout=5).returncode == 0
+
+
+def monitor_identity(monitor):
+    return {key: monitor.get(key, "") for key in ("name", "make", "model", "serial")}
+
+
+@contextmanager
+def monitor_transaction():
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    path = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "xr-hyprland/monitors.json"
+    with (runtime / "xr-hyprland-monitors.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = json.loads(path.read_text()) if path.exists() else {"version": 1, "monitors": {}}
+        if not isinstance(state, dict) or state.get("version") != 1 or not isinstance(state.get("monitors"), dict):
+            raise ValueError("Invalid XR monitor restore state")
+        try:
+            yield path, state
+        finally:
+            atomic_write(path, json.dumps(state, indent=2) + "\n")
+
+
+def monitor_power(name, enabled):
+    action = "enable" if enabled else "disable"
+    dispatch(f"hl.dsp.dpms({{monitor={lua_string(name)}, action=\"{action}\"}})")
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        monitor = next((item for item in query("monitors") if item["name"] == name), None)
+        if monitor is None or monitor.get("dpmsStatus") == enabled:
+            return
+        time.sleep(.05)
+    raise RuntimeError(f"Monitor {name} did not turn {'on' if enabled else 'off'}")
+
+
+def restore_monitor_state(path, state):
+    current = {item["name"]: item for item in query("monitors")}
+    failures = []
+    for name, saved in list(state["monitors"].items()):
+        monitor = current.get(name)
+        # A replacement display on the same connector is a different device.
+        if monitor is None or monitor_identity(monitor) != saved:
+            continue
+        try:
+            if not monitor.get("dpmsStatus", True):
+                monitor_power(name, True)
+            del state["monitors"][name]
+            atomic_write(path, json.dumps(state, indent=2) + "\n")
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            failures.append(str(error))
+    if failures:
+        raise RuntimeError("; ".join(failures))
+
+
+def restore_monitors():
+    with monitor_transaction() as (path, state):
+        if state["monitors"]:
+            restore_monitor_state(path, state)
+
+
+def monitors_off():
+    # ExecStartPost only runs after the renderer's READY notification. Recheck
+    # under the same lock used by cleanup so a concurrent stop always wins.
+    with monitor_transaction() as (path, state):
+        service = service_properties()
+        status = service.get("StatusText", "")
+        if (status != "XR display ready" and not status.startswith("XR desktop ready:")) or service.get("ActiveState") not in ("activating", "active"):
+            return
+        config = configuration()
+        override = config.get("target_output_name_override", "")
+        monitors = query("monitors")
+        def target(monitor):
+            return (monitor["name"] == override if override else
+                    monitor.get("make") == config.get("target_output_make", "Nreal") and
+                    monitor.get("model") == config.get("target_output_model", "Air"))
+        if not any(target(monitor) and monitor.get("dpmsStatus", False) for monitor in monitors):
+            raise RuntimeError("XR glasses unavailable; leaving regular monitors on")
+        selected = [monitor for monitor in monitors
+                    if not target(monitor) and monitor.get("make") not in ("Nreal", "XREAL")
+                    and monitor.get("physicalWidth", 0) > 0 and monitor.get("physicalHeight", 0) > 0
+                    and monitor.get("dpmsStatus", False)]
+        for monitor in selected:
+            state["monitors"][monitor["name"]] = monitor_identity(monitor)
+        # Persist the recovery record before the first power change.
+        atomic_write(path, json.dumps(state, indent=2) + "\n")
+        try:
+            for monitor in selected:
+                monitor_power(monitor["name"], False)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            restore_monitor_state(path, state)
+            raise
+
+
+def cleanup():
+    # Wake monitors even when window state is damaged or the capture client died.
+    try:
+        restore_monitors()
+    finally:
+        try:
+            restore_desktop()
+        finally:
+            restore_windows()
+
+
+def inventory():
+    metadata = json.loads(run(CONTROL, "windows", capture_output=True).stdout)
+    by_address = {window["address"]: window for window in metadata if window["address"]}
+    result = []
+    for client in query("clients"):
+        if client["address"] in by_address and client.get("mapped", False):
+            result.append(client | by_address[client["address"]])
+    return sorted(result, key=lambda window: window["identifier"])
+
+
+def source_monitor():
+    source = configuration().get("virtual_output_name", "XR-VIRTUAL")
+    return next((monitor for monitor in query("monitors") if monitor["name"] == source), None)
+
+
+def xr_windows(windows):
+    monitor = source_monitor()
+    if monitor is None:
+        return []
+    outputs = [monitor] + [output for output in query("monitors")
+                         if output["name"] in window_state().get("desktop", {}).get("outputs", {})]
+    return [window for window in windows if any(window["monitor"] == output["id"]
+            and window["workspace"]["id"] == output["activeWorkspace"]["id"] for output in outputs)]
+
+
+def scene_geometry(window):
+    outputs = {m["id"]: m for m in query("monitors")}
+    current = outputs[window["monitor"]]
+    desktop = window_state().get("desktop", {})
+    if not desktop.get("outputs"):
+        return window["at"], source_monitor()
+    anchor = desktop["anchor"].copy()
+    anchor["width"] /= anchor["scale"]
+    anchor["height"] /= anchor["scale"]
+    clone = desktop["outputs"].get(current["name"])
+    x, y = window["at"]
+    if clone:
+        return [x - current["x"] + clone["original"]["x"],
+                y - current["y"] + clone["original"]["y"]], anchor
+    return [x - current["x"] + anchor["x"] + (anchor["width"] - current["width"] / current["scale"]) / 2,
+            y - current["y"] + anchor["y"] + (anchor["height"] - current["height"] / current["scale"]) / 2], anchor
+
+
+def choose(windows, selector):
+    if selector is None:
+        address = query("activewindow").get("address")
+        selected = next((window for window in windows if window["address"] == address), None)
+    elif selector.isdecimal():
+        index = int(selector) - 1
+        selected = windows[index] if 0 <= index < len(windows) else None
+    else:
+        selected = next((window for window in windows
+                         if selector in (window["address"], window["identifier"])), None)
+    if selected is None:
+        raise RuntimeError("Window unavailable. Use xr-display list to select a window.")
+    return selected
+
+
+def restore_windows(selector="all"):
+    with state_transaction() as state:
+        if selector == "all" and not state["windows"]:
+            return
+        windows = inventory()
+        live = {window["identifier"]: window for window in windows}
+        state["placements"] = {identifier: pose for identifier, pose in state["placements"].items()
+                               if identifier in live}
+        wanted = None if selector == "all" else choose(windows, selector)["identifier"]
+        if wanted is not None and wanted not in state["windows"]:
+            selected = live[wanted]
+            if selected not in xr_windows(windows):
+                raise RuntimeError("This window is already on the regular desktop")
+            source = source_monitor()
+            if selected["monitor"] != source["id"]:
+                raise RuntimeError("This window belongs to a transferred workspace. Stop XR or use 'xr-display return all' to return the desktop.")
+            regular = [monitor for monitor in query("monitors")
+                       if monitor["name"] != source["name"] and monitor["make"] not in ("Nreal", "XREAL")]
+            if not regular:
+                raise RuntimeError("No regular monitor is available")
+            monitor = next((monitor for monitor in regular if monitor.get("focused")), regular[0])
+            target = lua_string("address:" + selected["address"])
+            workspace = int(monitor["activeWorkspace"]["id"])
+            dispatch(f"hl.dsp.window.move({{workspace={workspace}, follow=false, window={target}}})")
+            return
+        for identifier, saved in list(state["windows"].items()):
+            window = live.get(identifier)
+            if window is None:
+                del state["windows"][identifier]
+                continue
+            if wanted is not None and wanted != identifier:
+                continue
+            target = "address:" + window["address"]
+            name = saved["workspace"]["name"]
+            workspace = str(saved["workspace"]["id"]) if name.isdecimal() else lua_string("name:" + name)
+            dispatch(f"hl.dsp.window.move({{workspace={workspace}, follow=false, window={lua_string(target)}}})")
+            if window["floating"] != saved["floating"]:
+                dispatch(f"hl.dsp.window.float({{window={lua_string(target)}, action=\"toggle\"}})")
+            if saved["floating"]:
+                width, height = saved["size"]
+                x, y = saved["at"]
+                dispatch(f"hl.dsp.window.resize({{window={lua_string(target)}, x={int(width)}, y={int(height)}, relative=false}})")
+                dispatch(f"hl.dsp.window.move({{window={lua_string(target)}, x={int(x)}, y={int(y)}, relative=false}})")
+            del state["windows"][identifier]
+
+
+def start():
+    if not active():
+        cleanup()
+    variables = [name for name in ("WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "DISPLAY") if name in os.environ]
+    if variables:
+        run("systemctl", "--user", "import-environment", *variables)
+    if subprocess.run(["systemctl", "--user", "is-failed", "--quiet", SERVICE], timeout=5).returncode == 0:
+        run("systemctl", "--user", "reset-failed", SERVICE)
+    run("systemctl", "--user", "start", SERVICE, timeout=40)
+
+
+def stop():
+    # Finish file transactions before systemd runs the exit-time restore helper.
+    try:
+        cleanup()
+    finally:
+        run("systemctl", "--user", "stop", SERVICE)
+
+
+def move_window(selector):
+    if not active():
+        start()
+    deadline = time.monotonic() + 5
+    monitor = source_monitor()
+    while monitor is None and time.monotonic() < deadline:
+        time.sleep(.1)
+        monitor = source_monitor()
+    if monitor is None:
+        raise RuntimeError("XR output unavailable. Check journalctl --user -u xr-hyprland.")
+    with state_transaction() as state:
+        window = choose(inventory(), selector)
+        if window in xr_windows([window]):
+            return
+        if window["monitor"] != monitor["id"]:
+            state["windows"].setdefault(window["identifier"], {
+                key: window[key] for key in ("address", "workspace", "floating", "at", "size")})
+            # Persist the restore point before requesting the move.
+            path = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "xr-hyprland/windows.json"
+            atomic_write(path, json.dumps(state, indent=2) + "\n")
+        target = lua_string("address:" + window["address"])
+        workspace = int(monitor["activeWorkspace"]["id"])
+        dispatch(f"hl.dsp.window.move({{workspace={workspace}, follow=false, window={target}}})")
+
+
+def focus_window(selector):
+    windows = inventory()
+    if selector in ("next", "previous"):
+        candidates = xr_windows(windows)
+        if not candidates:
+            raise RuntimeError("No XR windows")
+        current = query("activewindow").get("address")
+        initial = -1 if selector == "next" else 0
+        index = next((i for i, window in enumerate(candidates) if window["address"] == current), initial)
+        offset = 1 if selector == "next" else -1
+        window = candidates[(index + offset) % len(candidates)]
+    else:
+        window = choose(windows, selector)
+    target = lua_string("address:" + window["address"])
+    dispatch(f"hl.dsp.focus({{window={target}}})")
+    x = int(window["at"][0] + window["size"][0] / 2)
+    y = int(window["at"][1] + window["size"][1] / 2)
+    dispatch(f"hl.dsp.cursor.move({{x={x}, y={y}}})")
+
+
+def placement(options):
+    windows = inventory()
+    window = choose(windows, options.window or options.value)
+    if window not in xr_windows(windows):
+        raise RuntimeError("Move this window into XR before placing it")
+    at, monitor = scene_geometry(window)
+    config = configuration()
+    distance = config.getfloat("display_distance", fallback=2)
+    pixel_scale = 2 * distance * math.tan(math.radians(config.getfloat("display_size", fallback=32) / 2)) / monitor["width"]
+    x = (at[0] - monitor["x"] + window["size"][0]/2 - monitor["width"]/2) * pixel_scale
+    y = -(at[1] - monitor["y"] + window["size"][1]/2 - monitor["height"]/2) * pixel_scale
+    with state_transaction() as state:
+        current = state["placements"].get(window["identifier"], {
+            "yaw": math.degrees(math.atan2(-x, distance)),
+            "pitch": math.degrees(math.atan2(y, math.hypot(x, distance))),
+            "distance": math.sqrt(x*x + y*y + distance*distance), "scale": 1.})
+        limits = {"yaw": (-180, 180), "pitch": (-80, 80), "distance": (.1, 100), "scale": (.25, 4)}
+        for key, (low, high) in limits.items():
+            value = getattr(options, key)
+            if value is not None:
+                if options.relative:
+                    value += current[key]
+                if not math.isfinite(value) or not low <= value <= high:
+                    raise ValueError(f"{key} must be between {low} and {high}")
+                current[key] = value
+        state["placements"][window["identifier"]] = current
+        print(json.dumps(current))
+
+
+def layout(name):
+    if name not in ("row", "grid", "reset"):
+        raise ValueError("Layout must be row, grid, or reset")
+    windows = xr_windows(inventory())
+    distance = configuration().getfloat("display_distance", fallback=2)
+    with state_transaction() as state:
+        count = len(windows)
+        for index, window in enumerate(windows):
+            if name == "reset":
+                state["placements"].pop(window["identifier"], None)
+                continue
+            columns = min(count, 3) if name == "grid" else count
+            row, column = divmod(index, max(1, columns))
+            rows = math.ceil(count / max(1, columns))
+            state["placements"][window["identifier"]] = {
+                "yaw": (column - (columns - 1) / 2) * min(25, 150 / max(1, columns - 1)),
+                "pitch": ((rows - 1) / 2 - row) * min(18, 150 / max(1, rows - 1)),
+                "distance": distance, "scale": 1.}
+
+
+def set_ipd(value):
+    with state_transaction():
+        current = configuration().getfloat("ipd_mm", fallback=64)
+        if value is None:
+            print(f"IPD is {current:g} mm")
+            return
+        if value in ("+", "-"):
+            millimeters = current + (.5 if value == "+" else -.5)
+        else:
+            millimeters = 64. if value == "reset" else float(value)
+        if not math.isfinite(millimeters) or not 45 <= millimeters <= 80:
+            raise ValueError("IPD must be between 45 and 80 mm")
+        if active():
+            run(CONTROL, "ipd", str(millimeters))
+        set_config("ipd_mm", f"{millimeters:g}")
+        print(f"IPD set to {millimeters:g} mm")
+
+
+def change_view(value):
+    if value not in ("desktop", "windows"):
+        raise ValueError("View must be desktop or windows")
+    source = source_monitor()
+    addresses = [window["address"] for window in inventory() if source and window["monitor"] == source["id"]]
+    running = active()
+    if running:
+        stop()
+    with state_transaction():
+        set_config("view_mode", value)
+    if running:
+        start()
+        for address in addresses:
+            move_window(address)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", nargs="?", default="toggle", choices=(
+        "start", "stop", "toggle", "recenter", "move", "return", "restore", "list",
+        "focus", "layout", "place", "ipd", "view", "status", "wake", "monitors-off", "cleanup", "enter", "prepare"))
+    parser.add_argument("value", nargs="?")
+    parser.add_argument("--window")
+    parser.add_argument("--yaw", type=float)
+    parser.add_argument("--pitch", type=float)
+    parser.add_argument("--distance", type=float)
+    parser.add_argument("--scale", type=float)
+    parser.add_argument("--relative", action="store_true")
+    options = parser.parse_args()
+    action = options.action
+    if action == "toggle":
+        action = "stop" if active() else "start"
+    if action == "start": start()
+    elif action == "stop": stop()
+    elif action == "wake": restore_monitors()
+    elif action == "monitors-off": monitors_off()
+    elif action == "cleanup": cleanup()
+    elif action == "enter": enter()
+    elif action == "prepare": prepare()
+    elif action == "recenter": run(CONTROL, "recenter")
+    elif action == "move": move_window(options.window or options.value)
+    elif action in ("return", "restore"):
+        if options.value == "all":
+            cleanup()
+        else:
+            restore_windows("all" if action == "restore" else options.window or options.value)
+    elif action == "focus": focus_window(options.window or options.value)
+    elif action == "layout": layout(options.value)
+    elif action == "place": placement(options)
+    elif action == "ipd": set_ipd(options.value)
+    elif action == "view": change_view(options.value)
+    elif action == "list":
+        windows = inventory()
+        selected = {window["identifier"] for window in xr_windows(windows)}
+        for index, window in enumerate(windows, 1):
+            title = "".join(char for char in window["title"] if char.isprintable())
+            marker = "XR" if window["identifier"] in selected else "desktop"
+            print(f"{index:2}  {marker:7}  {window['address']}  {window['app_id']}  {title}")
+    elif action == "status":
+        print("XR renderer is " + ("running" if active() else "stopped"))
+        monitor = source_monitor()
+        if monitor:
+            print(f"{monitor['name']} uses workspace {monitor['activeWorkspace']['name']}")
+        config = configuration()
+        print(f"View {config.get('view_mode', 'desktop')}, stereo {config.get('stereo_mode', 'auto')}, IPD {config.get('ipd_mm', '64')} mm")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError, configparser.Error,
+            subprocess.SubprocessError) as error:
+        print(f"xr-display: {error}", file=sys.stderr)
+        sys.exit(1)

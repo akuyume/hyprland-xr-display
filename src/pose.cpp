@@ -17,6 +17,85 @@ uint64_t epochMs() {
              std::chrono::system_clock::now().time_since_epoch())
       .count();
 }
+
+static double dot(Quat a, Quat b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+}
+
+static Quat interpolate(Quat from, Quat to, double amount) {
+  double cosine = dot(from, to);
+  if (cosine < 0) {
+    to = {-to.x, -to.y, -to.z, -to.w};
+    cosine = -cosine;
+  }
+  double a = 1 - amount, b = amount;
+  if (cosine < .9995) {
+    double angle = std::acos(cosine);
+    a = std::sin(a * angle) / std::sin(angle);
+    b = std::sin(b * angle) / std::sin(angle);
+  }
+  return Quat{a * from.x + b * to.x, a * from.y + b * to.y,
+              a * from.z + b * to.z, a * from.w + b * to.w}
+      .normalized();
+}
+
+void HeadTracking::resetFilter(const Pose &pose) {
+  previous_ = filtered_ = pose.orientation;
+  timestamp_ = pose.timestamp;
+  generation_ = pose.referenceGeneration;
+  speed_ = 0;
+  interrupted_ = false;
+}
+
+HeadTracking::Change HeadTracking::update(const Pose &pose) {
+  if (!pose.valid) {
+    if (pose.status != "inconsistent pose record")
+      interrupted_ = true;
+    return Change::none;
+  }
+
+  const bool referenceReset = pose.referenceGeneration != generation_;
+  const uint64_t elapsed =
+      pose.timestamp > timestamp_ ? pose.timestamp - timestamp_ : 0;
+  if (!initialized_ || referenceReset || interrupted_ || elapsed > timeout_) {
+    reference_ = pose.orientation * rotation().inverse();
+    resetFilter(pose);
+    if (!initialized_) {
+      initialized_ = true;
+      return Change::acquired;
+    }
+    return referenceReset ? Change::referenceReset : Change::resumed;
+  }
+
+  if (elapsed >= 250) {
+    resetFilter(pose);
+  } else if (elapsed > 0) {
+    // Air Lab's 1 Euro tuning in Hz and degrees per second.
+    const double dt = elapsed / 1000.0;
+    const auto weight = [dt](double cutoff) {
+      const double step = 2 * pi * cutoff * dt;
+      return step / (1 + step);
+    };
+    const double angle =
+        2 * std::acos(std::min(1., std::abs(dot(previous_, pose.orientation))));
+    speed_ += weight(2) * (angle * 180 / (pi * dt) - speed_);
+    filtered_ =
+        interpolate(filtered_, pose.orientation, weight(.6 + .35 * speed_));
+    previous_ = pose.orientation;
+    timestamp_ = pose.timestamp;
+  }
+  return Change::none;
+}
+
+bool HeadTracking::recenter(const Pose &pose) {
+  if (!pose.valid)
+    return false;
+  reference_ = pose.orientation;
+  resetFilter(pose);
+  initialized_ = true;
+  return true;
+}
+
 template <class T> static T unpack(std::span<const uint8_t> b, size_t at) {
   T v;
   std::memcpy(&v, b.data() + at, sizeof v);
@@ -157,7 +236,37 @@ Pose decodeOpenTrack(std::span<const uint8_t> b, uint64_t received) {
       "tracking (XRLinuxDriver OpenTrack 52-byte UDP; receive timestamp)";
   return p;
 }
-OpenTrackPose::OpenTrackPose(int port, uint64_t timeout) : timeout_(timeout) {
+
+bool OpenTrackSequence::accept(uint32_t frame, uint16_t sender, Pose &pose) {
+  if (initialized_) {
+    if (sender != sender_) {
+      ++generation_;
+    } else {
+      const uint32_t advance = frame - frame_;
+      if (advance == 0)
+        return false;
+      if (advance >= (uint32_t{1} << 31)) {
+        // Air Lab detects a return to frame zero. Allow for a few dropped
+        // packets at restart, or accept a new counter after a stale feed.
+        const bool restarted = frame <= 10 && frame_ > 10;
+        const bool stale = pose.timestamp > timestamp_ &&
+                           pose.timestamp - timestamp_ > timeout_;
+        if (!restarted && !stale)
+          return false;
+        ++generation_;
+      }
+    }
+  }
+  initialized_ = true;
+  frame_ = frame;
+  sender_ = sender;
+  timestamp_ = pose.timestamp;
+  pose.referenceGeneration = generation_;
+  return true;
+}
+
+OpenTrackPose::OpenTrackPose(int port, uint64_t timeout)
+    : timeout_(timeout), sequence_(timeout) {
   if (port < 1024 || port > 65535)
     throw std::runtime_error("invalid OpenTrack UDP port");
   fd_ = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -188,7 +297,7 @@ Pose OpenTrackPose::sample() {
   // Drain all pending packets, retaining only the latest. Bounded socket queue.
   for (int i = 0; i < 256; ++i) {
     std::array<uint8_t, 53> b{};
-    std::array<char, CMSG_SPACE(sizeof(timespec))> control{};
+    alignas(cmsghdr) std::array<char, CMSG_SPACE(sizeof(timespec))> control{};
     iovec io{b.data(), b.size()};
     sockaddr_in sender{};
     msghdr msg{};
@@ -214,14 +323,10 @@ Pose OpenTrackPose::sample() {
         received = uint64_t(t.tv_sec) * 1000 + t.tv_nsec / 1000000;
       }
     auto p = decodeOpenTrack(std::span(b).first(size_t(n)), received);
-    if (p.valid) {
-      uint32_t seq = unpack<uint32_t>(b, 48);
-      if (haveSequence_ && seq == sequence_)
-        continue;
-      sequence_ = seq;
-      haveSequence_ = true;
+    if (p.valid &&
+        sequence_.accept(unpack<uint32_t>(b, 48), ntohs(sender.sin_port), p))
       last_ = p;
-    } else if (!last_.valid)
+    else if (!p.valid && !last_.valid)
       last_ = p;
   }
   auto p = last_;

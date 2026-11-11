@@ -1,0 +1,19 @@
+[Unit]
+Description=Hyprland XR desktop on XREAL Air
+After=xr-driver.service hyprland-session.target
+PartOf=hyprland-session.target
+Requires=xr-driver.service
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStartPre=%h/.local/bin/xr-display prepare
+ExecStart=%h/.local/bin/xr-hyprland --config %h/.config/xr-hyprland/config.ini
+ExecStartPost=%h/.local/bin/xr-display enter
+ExecStopPost=-%h/.local/bin/xr-display cleanup
+TimeoutStartSec=30
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10

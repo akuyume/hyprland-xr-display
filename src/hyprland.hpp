@@ -5,6 +5,7 @@
 namespace xr {
 std::string hypr(const std::vector<std::string> &args);
 nlohmann::json monitors();
+nlohmann::json hyprQuery(const std::string &name);
 class VirtualOutput {
   bool owned_ = false;
   int id_ = -1;

@@ -2,3 +2,4 @@
 /build-*/
 /CMakeUserPresets.json
 *.log
+/air-lab/

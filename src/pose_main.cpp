@@ -63,6 +63,7 @@ int main(int argc, char **argv) {
                 << " sampled_updates_hz=" << updates / dt
                 << " connected=" << p.connected
                 << " calibration=" << p.calibration
+                << " reference_generation=" << p.referenceGeneration
                 << " timestamp=" << p.timestamp << " " << p.status << std::endl;
       updates = 0;
       report = now;

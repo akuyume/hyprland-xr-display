@@ -67,24 +67,32 @@ void Config::load(const std::string &path) {
     STR(target_output_make)
     STR(target_output_model)
     STR(target_output_name_override)
-    STR(virtual_output_name) STR(virtual_resolution) STR(capture_backend)
-        STR(pose_backend) STR(pose_path) STR(drm_device)
-            NUM(virtual_refresh_rate) NUM(virtual_scale) NUM(display_distance)
-                NUM(display_size) NUM(horizontal_fov) NUM(vertical_fov)
-                    NUM(yaw_offset) NUM(pitch_offset) NUM(render_refresh_rate)
-                        INT(opentrack_port) INT(pose_timeout_ms)
-                            BOOL(roll_enabled) BOOL(invert_yaw)
-                                BOOL(invert_pitch) BOOL(invert_roll)
+    STR(stereo_mode)
+    STR(driver_state_path) STR(view_mode) NUM(ipd_mm) STR(virtual_output_name)
+        STR(virtual_resolution) STR(capture_backend) STR(pose_backend)
+            STR(pose_path) STR(drm_device) NUM(virtual_refresh_rate)
+                NUM(virtual_scale) NUM(display_distance) NUM(display_size)
+                    NUM(horizontal_fov) NUM(vertical_fov) NUM(yaw_offset)
+                        NUM(pitch_offset) NUM(render_refresh_rate)
+                            INT(opentrack_port) INT(pose_timeout_ms)
+                                BOOL(roll_enabled) BOOL(invert_yaw)
+                                    BOOL(invert_pitch) BOOL(invert_roll)
 #undef STR
 #undef NUM
 #undef BOOL
 #undef INT
-                                    throw std::runtime_error(
-                                        "unknown config key: " + k);
+                                        throw std::runtime_error(
+                                            "unknown config key: " + k);
   }
   validate();
 }
 void Config::validate() const {
+  if (view_mode != "desktop" && view_mode != "windows")
+    throw std::runtime_error("view_mode must be desktop or windows");
+  if (stereo_mode != "auto" && stereo_mode != "mono" && stereo_mode != "sbs")
+    throw std::runtime_error("stereo_mode must be auto, mono, or sbs");
+  if (!std::isfinite(ipd_mm) || ipd_mm < 45 || ipd_mm > 80)
+    throw std::runtime_error("ipd_mm must be between 45 and 80");
   if (!std::regex_match(virtual_output_name, std::regex("[A-Za-z0-9_-]{1,64}")))
     throw std::runtime_error("invalid virtual output name");
   std::smatch m;

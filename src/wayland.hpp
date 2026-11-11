@@ -23,6 +23,9 @@ public:
   void dispatch(int timeoutMs);
   void render(Quat delta);
   void maintain();
+  void setIpd(double millimeters);
+  bool ready() const;
+  std::string desktopGeneration() const;
   std::string statistics() const;
 };
 } // namespace xr

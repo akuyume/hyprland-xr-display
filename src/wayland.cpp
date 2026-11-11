@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "wayland.hpp"
 #include "linux-dmabuf-v1-client.h"
+#include "scene.hpp"
+#include "shaders.hpp"
+#include "shm.hpp"
+#include "stereo.hpp"
 #include "wlr-layer-shell-unstable-v1-client.h"
 #include "wlr-screencopy-unstable-v1-client.h"
 #include "xdg-shell-client.h"
@@ -47,6 +51,7 @@ struct Display::Impl {
     uint32_t id;
     wl_output *wl;
     std::string name, make, model;
+    int width = 0, height = 0, scale = 1, transform = 0;
     bool alive = true;
   };
   std::map<uint32_t, std::unique_ptr<Output>> outputs;
@@ -59,6 +64,7 @@ struct Display::Impl {
   Output *target = nullptr;
   Output *captured = nullptr;
   bool configured = false, closed = false, framePermit = true;
+  bool contentPresented = false;
   int width = 1920, height = 1080;
   EGLDisplay egl = EGL_NO_DISPLAY;
   EGLContext context = EGL_NO_CONTEXT;
@@ -83,14 +89,22 @@ struct Display::Impl {
     GLsync fence = nullptr;
     void *map = MAP_FAILED;
     size_t bytes = 0;
-    uint32_t width = 0, height = 0, stride = 0, format = 0;
+    uint32_t width = 0, height = 0, stride = 0, format = 0, pixelBytes = 0;
     bool gpu = false, swapRB = false, flip = false, waiting = false;
   } slots[2];
+  std::vector<uint8_t> packedShmRows;
   int front = -1, pending = -1;
   zwlr_screencopy_frame_v1 *frame = nullptr;
   uint32_t sw = 0, sh = 0, stride = 0, shmFormat = 0, dw = 0, dh = 0,
            dmaFormat = 0;
   bool dmaOff = false, loggedPath = false;
+  std::optional<bool> hardwareSbs;
+  StereoLayout lastLayout = StereoLayout::waiting;
+  bool layoutLogged = false;
+  std::chrono::steady_clock::time_point lastStereoRead{};
+  std::chrono::steady_clock::time_point lastSceneRead{};
+  std::unique_ptr<Windows> windows;
+  std::unique_ptr<Scene> scene;
   struct Capture final : CaptureBackend {
     Impl &a;
     explicit Capture(Impl &a) : a(a) {}
@@ -135,6 +149,8 @@ struct Display::Impl {
                       8,
                       EGL_BLUE_SIZE,
                       8,
+                      EGL_DEPTH_SIZE,
+                      24,
                       EGL_NONE};
     EGLint count = 0;
     require(eglChooseConfig(egl, attrs, &eglConfig, 1, &count) && count,
@@ -161,22 +177,15 @@ struct Display::Impl {
     if (dmaOff && cfg.capture_backend == "dmabuf")
       throw std::runtime_error("requested DMA-BUF path unavailable");
     initShader();
+    if (cfg.view_mode == "windows") {
+      windows = std::make_unique<Windows>(display);
+      require(windows->supported(),
+              "individual-window capture protocols unavailable");
+      scene = std::make_unique<Scene>(source);
+    }
     maintain();
   }
   void initShader() {
-    const char *vs = R"(#version 300 es
- precision highp float;out vec2 uv;
- void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);uv=p;gl_Position=vec4(p*2.-1.,0.,1.);})";
-    const char *fs = R"(#version 300 es
- precision highp float;in vec2 uv;out vec4 color;
- uniform sampler2D desktop;uniform vec4 rotation;uniform vec2 fov;uniform vec2 halfSize;uniform float distanceToPlane;
- uniform bool flatView;uniform bool flipY;uniform bool swapRB;
- vec3 rotateQ(vec3 v){return v+2.*cross(rotation.xyz,cross(rotation.xyz,v)+rotation.w*v);}
- void main(){vec2 tc=uv;
- if(!flatView){vec3 ray=rotateQ(vec3((uv*2.-1.)*fov,-1.));if(ray.z>=-0.0001){color=vec4(0.,0.,0.,1.);return;}
- vec2 hit=ray.xy*(-distanceToPlane/ray.z);tc=hit/(2.*halfSize)+0.5;}
- if(any(lessThan(tc,vec2(0.)))||any(greaterThan(tc,vec2(1.)))){color=vec4(0.,0.,0.,1.);return;}
- if(!flipY)tc.y=1.-tc.y;vec3 c=texture(desktop,tc).rgb;if(swapRB)c=c.bgr;color=vec4(c,1.);})";
     auto shader = [](GLenum type, const char *text) {
       GLuint s = glCreateShader(type);
       glShaderSource(s, 1, &text, nullptr);
@@ -191,7 +200,8 @@ struct Display::Impl {
       }
       return s;
     };
-    auto v = shader(GL_VERTEX_SHADER, vs), f = shader(GL_FRAGMENT_SHADER, fs);
+    auto v = shader(GL_VERTEX_SHADER, vertexShader),
+         f = shader(GL_FRAGMENT_SHADER, fragmentShader);
     program = glCreateProgram();
     glAttachShader(program, v);
     glAttachShader(program, f);
@@ -213,8 +223,8 @@ struct Display::Impl {
     wl_region_destroy(region);
     if (preview) {
       require(xdg, "xdg-shell unavailable");
-      width = 960;
-      height = 540;
+      width = cfg.stereo_mode == "sbs" ? 1280 : 960;
+      height = cfg.stereo_mode == "sbs" ? 360 : 540;
       xs = xdg_wm_base_get_xdg_surface(xdg, surface);
       xdg_surface_add_listener(xs, &xsListener, this);
       top = xdg_surface_get_toplevel(xs);
@@ -272,7 +282,16 @@ struct Display::Impl {
     target = nullptr;
   }
   void maintain() {
-    if (closed) {
+    auto now = std::chrono::steady_clock::now();
+    if (!preview && now - lastStereoRead >= std::chrono::milliseconds(250)) {
+      hardwareSbs = readStereoState(cfg.driver_state_path, epochMs());
+      lastStereoRead = now;
+    }
+    if (scene && now - lastSceneRead >= std::chrono::milliseconds(200)) {
+      scene->refreshSettings();
+      lastSceneRead = now;
+    }
+    if (closed || (target && !target->alive)) {
       destroySurface();
       closed = false;
       if (preview)
@@ -330,7 +349,9 @@ struct Display::Impl {
         ++i;
     if (!error.empty())
       throw std::runtime_error(error);
-    if (window && captured)
+    if (window && windows)
+      windows->update(scene->addresses(), cfg.virtual_refresh_rate);
+    if (window && captured && (!scene || scene->addresses().empty()))
       backend.request();
   }
   void clearSlot(Slot &s) {
@@ -498,20 +519,22 @@ struct Display::Impl {
       dmaOff = true;
       std::cerr << "DMA-BUF allocation/import unavailable; using SHM upload\n";
     }
-    require(sw > 0 && sh > 0 && sw <= 8192 && sh <= 8192 && stride >= sw * 4 &&
-                stride <= sw * 4 + 65536 && stride % 4 == 0,
+    const auto layout = shmFormatInfo(shmFormat);
+    require(layout.pixelBytes != 0, "unsupported SHM format");
+    require(sw > 0 && sh > 0 && sw <= 8192 && sh <= 8192,
             "invalid SHM capture dimensions");
-    require(shmFormat == WL_SHM_FORMAT_XRGB8888 ||
-                shmFormat == WL_SHM_FORMAT_ARGB8888 ||
-                shmFormat == WL_SHM_FORMAT_XBGR8888 ||
-                shmFormat == WL_SHM_FORMAT_ABGR8888,
-            "unsupported SHM format");
+    const uint32_t rowBytes = sw * layout.pixelBytes;
+    require(stride >= rowBytes && stride <= rowBytes + 65536,
+            "invalid SHM capture stride");
+    const size_t packedBytes = size_t(rowBytes) * sh;
+    if (stride % layout.pixelBytes != 0 && packedShmRows.size() < packedBytes)
+      packedShmRows.resize(packedBytes);
     s.width = sw;
     s.height = sh;
     s.stride = stride;
     s.format = shmFormat;
-    s.swapRB = shmFormat == WL_SHM_FORMAT_XRGB8888 ||
-               shmFormat == WL_SHM_FORMAT_ARGB8888;
+    s.pixelBytes = layout.pixelBytes;
+    s.swapRB = layout.swapRB;
     s.bytes = size_t(stride) * sh;
     int fd = memfd_create("xr-capture", MFD_CLOEXEC);
     require(fd >= 0, "capture memfd failed");
@@ -529,18 +552,30 @@ struct Display::Impl {
     wl_shm_pool_destroy(pool);
     close(fd);
     setupTexture(s);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sw, sh, 0, GL_RGBA,
+    const GLenum uploadFormat = s.pixelBytes == 3 ? GL_RGB : GL_RGBA;
+    glTexImage2D(GL_TEXTURE_2D, 0, uploadFormat, sw, sh, 0, uploadFormat,
                  GL_UNSIGNED_BYTE, nullptr);
     zwlr_screencopy_frame_v1_copy(frame, s.buffer);
   }
   void ready() {
     auto &s = slots[pending];
     if (!s.gpu) {
+      const GLenum uploadFormat = s.pixelBytes == 3 ? GL_RGB : GL_RGBA;
+      const void *pixels = s.map;
+      uint32_t rowLength = s.stride / s.pixelBytes;
+      if (s.stride % s.pixelBytes != 0) {
+        packShmRows(packedShmRows.data(), s.map, s.width * s.pixelBytes,
+                    s.height, s.stride);
+        pixels = packedShmRows.data();
+        rowLength = s.width;
+      }
       glBindTexture(GL_TEXTURE_2D, s.tex);
-      glPixelStorei(GL_UNPACK_ROW_LENGTH, s.stride / 4);
-      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s.width, s.height, GL_RGBA,
-                      GL_UNSIGNED_BYTE, s.map);
+      glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+      glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLength);
+      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s.width, s.height, uploadFormat,
+                      GL_UNSIGNED_BYTE, pixels);
       glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+      glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     }
     if (!loggedPath) {
       std::cerr << "capture backend: wlr-screencopy "
@@ -567,13 +602,26 @@ struct Display::Impl {
             "EGL render context lost");
     glViewport(0, 0, width, height);
     glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    if (front >= 0) {
-      auto &s = slots[front];
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    const auto layout = stereoLayout(
+        cfg.stereo_mode, preview, width, height, target ? target->width : width,
+        target ? target->height : height, target ? target->scale : 1,
+        target ? target->transform : 0, hardwareSbs);
+    if (!layoutLogged || layout != lastLayout) {
+      std::cerr << "presentation: "
+                << (layout == StereoLayout::sbs ? "stereo SBS"
+                    : layout == StereoLayout::mono
+                        ? "mono"
+                        : "waiting for matching Air mode/transport")
+                << "; IPD=" << cfg.ipd_mm << " mm\n";
+      lastLayout = layout;
+      layoutLogged = true;
+    }
+    bool drewContent = false;
+    if (layout != StereoLayout::waiting) {
       glUseProgram(program);
       glBindVertexArray(vao);
       glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, backend.texture());
       auto uniform = [&](const char *n) {
         return glGetUniformLocation(program, n);
       };
@@ -585,17 +633,63 @@ struct Display::Impl {
       glUniform4f(uniform("rotation"), q.x, q.y, q.z, q.w);
       glUniform2f(uniform("fov"), std::tan(rad(cfg.horizontal_fov / 2)),
                   std::tan(rad(cfg.vertical_fov / 2)));
-      float hw = cfg.display_distance * std::tan(rad(cfg.display_size / 2));
-      glUniform2f(uniform("halfSize"), hw, hw * s.height / s.width);
-      glUniform1f(uniform("distanceToPlane"), cfg.display_distance);
-      glUniform1i(uniform("flatView"), flat);
-      glUniform1i(uniform("flipY"), s.flip);
-      glUniform1i(uniform("swapRB"), s.swapRB);
+      glUniform1i(uniform("flatView"), flat && !scene);
       glUniform1i(uniform("desktop"), 0);
-      glDrawArrays(GL_TRIANGLES, 0, 3);
-      if (s.fence)
-        glDeleteSync(s.fence);
-      s.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+      auto panels =
+          scene ? scene->panels(windows->images(), cfg) : std::vector<Panel>{};
+      std::ranges::sort(panels, [](const auto &a, const auto &b) {
+        return a.center.x * a.center.x + a.center.y * a.center.y +
+                   a.center.z * a.center.z >
+               b.center.x * b.center.x + b.center.y * b.center.y +
+                   b.center.z * b.center.z;
+      });
+      auto draw = [&](GLuint texture, Vec center, Quat rotation, double hw,
+                      double hh, bool flip, bool swap, bool opaque) {
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glUniform3f(uniform("planeCenter"), center.x, center.y, center.z);
+        glUniform4f(uniform("planeRotation"), rotation.x, rotation.y,
+                    rotation.z, rotation.w);
+        glUniform2f(uniform("halfSize"), hw, hh);
+        glUniform1i(uniform("flipY"), flip);
+        glUniform1i(uniform("swapRB"), swap);
+        glUniform1i(uniform("opaque"), opaque);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        drewContent = true;
+      };
+      const int eyes = layout == StereoLayout::sbs ? 2 : 1;
+      const int eyeWidth = width / eyes;
+      glEnable(GL_SCISSOR_TEST);
+      glEnable(GL_DEPTH_TEST);
+      glDepthFunc(GL_LEQUAL);
+      glEnable(GL_BLEND);
+      glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+      for (int eye = 0; eye < eyes; ++eye) {
+        glViewport(eye * eyeWidth, 0, eyeWidth, height);
+        glScissor(eye * eyeWidth, 0, eyeWidth, height);
+        glUniform1f(uniform("eyeOffset"),
+                    eyes == 2 ? eyeOffset(eye, cfg.ipd_mm) : 0);
+        if (scene && !scene->addresses().empty()) {
+          for (const auto &panel : panels)
+            draw(panel.image.texture, panel.center, panel.rotation,
+                 panel.halfWidth, panel.halfHeight, false, panel.image.swapRB,
+                 panel.image.opaque);
+        } else if (front >= 0) {
+          const auto &s = slots[front];
+          const double hw =
+              cfg.display_distance * std::tan(rad(cfg.display_size / 2));
+          draw(backend.texture(), {0, 0, -cfg.display_distance}, {}, hw,
+               hw * s.height / s.width, s.flip, s.swapRB, true);
+        }
+      }
+      glDisable(GL_SCISSOR_TEST);
+      glDisable(GL_DEPTH_TEST);
+      glDisable(GL_BLEND);
+      if (front >= 0) {
+        auto &s = slots[front];
+        if (s.fence)
+          glDeleteSync(s.fence);
+        s.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+      }
       glFlush();
     }
     require(glGetError() == GL_NO_ERROR, "OpenGL render/upload failed");
@@ -603,6 +697,7 @@ struct Display::Impl {
     wl_callback_add_listener(callback, &callbackListener, this);
     framePermit = false;
     require(eglSwapBuffers(egl, eglSurface), "EGL swap failed");
+    contentPresented = drewContent;
     auto period =
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(1. / cfg.render_refresh_rate));
@@ -631,8 +726,10 @@ struct Display::Impl {
             "Wayland protocol error");
   }
   ~Impl() {
+    scene.reset();
     if (context != EGL_NO_CONTEXT) {
       eglMakeCurrent(egl, EGL_NO_SURFACE, EGL_NO_SURFACE, context);
+      windows.reset();
       resetCapture();
       if (program)
         glDeleteProgram(program);
@@ -670,14 +767,24 @@ struct Display::Impl {
 };
 const wl_output_listener Display::Impl::outputListener = {
     [](void *d, wl_output *, int32_t, int32_t, int32_t, int32_t, int32_t,
-       const char *make, const char *model, int32_t) {
+       const char *make, const char *model, int32_t transform) {
       auto &o = *static_cast<Output *>(d);
       o.make = make;
       o.model = model;
+      o.transform = transform;
     },
-    [](void *, wl_output *, uint32_t, int32_t, int32_t, int32_t) {},
+    [](void *d, wl_output *, uint32_t flags, int32_t width, int32_t height,
+       int32_t) {
+      if (flags & WL_OUTPUT_MODE_CURRENT) {
+        auto &o = *static_cast<Output *>(d);
+        o.width = width;
+        o.height = height;
+      }
+    },
     [](void *, wl_output *) {},
-    [](void *, wl_output *, int32_t) {},
+    [](void *d, wl_output *, int32_t scale) {
+      static_cast<Output *>(d)->scale = scale;
+    },
     [](void *d, wl_output *, const char *n) {
       static_cast<Output *>(d)->name = n;
     },
@@ -829,10 +936,27 @@ Display::~Display() = default;
 void Display::dispatch(int ms) { p->dispatch(ms); }
 void Display::render(Quat q) { p->render(q); }
 void Display::maintain() { p->maintain(); }
+bool Display::ready() const { return p->contentPresented; }
+std::string Display::desktopGeneration() const {
+  return p->contentPresented && p->scene
+             ? p->scene->readyGeneration(p->windows->images())
+             : std::string{};
+}
+void Display::setIpd(double millimeters) {
+  require(std::isfinite(millimeters) && millimeters >= 45 && millimeters <= 80,
+          "IPD must be between 45 and 80 mm");
+  p->cfg.ipd_mm = millimeters;
+  std::cerr << "IPD=" << millimeters << " mm\n";
+}
 std::string Display::statistics() const {
   return "rendered=" + std::to_string(p->rendered) +
          " captured=" + std::to_string(p->capturedFrames) +
          " capture_failed=" + std::to_string(p->failed) +
-         " busy_buffer_drops=" + std::to_string(p->dropped);
+         " busy_buffer_drops=" + std::to_string(p->dropped) +
+         (p->windows
+              ? " window_frames=" + std::to_string(p->windows->frames()) +
+                    " window_failed=" + std::to_string(p->windows->failures()) +
+                    " scene=" + p->scene->status()
+              : "");
 }
 } // namespace xr

@@ -42,10 +42,18 @@ inline Quat axisPolicy(Quat q, bool iy, bool ip, bool ir, bool roll) {
   if (s < 1e-9)
     return {};
   double a = 2 * std::atan2(s, q.w);
-  Vec v{q.x / s * a * (ip ? -1 : 1), q.y / s * a * (iy ? -1 : 1),
-        roll ? q.z / s * a * (ir ? -1 : 1) : 0};
-  double n = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-  return n < 1e-9 ? Quat{} : Quat::axis({v.x / n, v.y / n, v.z / n}, n);
+  auto adjusted = Quat::axis({q.x / s * (ip ? -1 : 1), q.y / s * (iy ? -1 : 1),
+                              q.z / s * (roll && ir ? -1 : 1)},
+                             a);
+  if (roll)
+    return adjusted;
+  // Reconstruct a level camera from its forward ray. Zeroing the quaternion's
+  // roll component would also change where a combined rotation is looking.
+  auto forward = adjusted.rotate({0, 0, -1});
+  auto horizontal = std::hypot(forward.x, forward.z);
+  auto yaw = horizontal > 1e-9 ? std::atan2(-forward.x, -forward.z) : 0.;
+  auto pitch = std::atan2(forward.y, horizontal);
+  return Quat::axis({0, 1, 0}, yaw) * Quat::axis({1, 0, 0}, pitch);
 }
 inline std::array<double, 3> euler(Quat q) {
   // Diagnostics only: yaw(Y), pitch(X), roll(Z), intrinsic Y-X-Z.

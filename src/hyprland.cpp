@@ -1,11 +1,78 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "hyprland.hpp"
+#include <chrono>
+#include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <poll.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 namespace xr {
+nlohmann::json hyprQuery(const std::string &name) {
+  if (name != "clients" && name != "monitors")
+    throw std::runtime_error("unsupported scene query");
+  const auto *runtime = getenv("XDG_RUNTIME_DIR");
+  const auto *signature = getenv("HYPRLAND_INSTANCE_SIGNATURE");
+  if (!runtime || !signature)
+    throw std::runtime_error("Hyprland session environment missing");
+  const auto path =
+      std::string(runtime) + "/hypr/" + signature + "/.socket.sock";
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  if (path.size() >= sizeof(address.sun_path))
+    throw std::runtime_error("Hyprland socket path too long");
+  path.copy(address.sun_path, path.size());
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+  if (fd < 0)
+    throw std::runtime_error("Hyprland scene socket failed");
+  try {
+    int result =
+        connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address));
+    if (result && errno != EINPROGRESS && errno != EAGAIN)
+      throw std::runtime_error("Hyprland scene connection failed");
+    pollfd socketPoll{fd, POLLOUT, 0};
+    if (poll(&socketPoll, 1, 200) <= 0)
+      throw std::runtime_error("Hyprland scene connection timeout");
+    const auto request = "j/" + name;
+    if (send(fd, request.data(), request.size(), MSG_NOSIGNAL) !=
+        ssize_t(request.size()))
+      throw std::runtime_error("Hyprland scene request failed");
+    std::string text;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    while (std::chrono::steady_clock::now() < deadline) {
+      socketPoll.events = POLLIN;
+      if (poll(&socketPoll, 1, 20) < 0) {
+        if (errno == EINTR)
+          continue;
+        throw std::runtime_error("Hyprland scene read failed");
+      }
+      char buffer[8192];
+      const auto count = recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT);
+      if (count == 0) {
+        close(fd);
+        fd = -1;
+        return nlohmann::json::parse(text);
+      }
+      if (count < 0) {
+        if (errno == EAGAIN || errno == EINTR)
+          continue;
+        throw std::runtime_error("Hyprland scene read failed");
+      }
+      text.append(buffer, count);
+      if (text.size() > 8 * 1024 * 1024)
+        throw std::runtime_error("Hyprland scene too large");
+    }
+    throw std::runtime_error("Hyprland scene response timeout");
+  } catch (...) {
+    if (fd >= 0)
+      close(fd);
+    throw;
+  }
+}
 std::string hypr(const std::vector<std::string> &args) {
   int p[2];
   if (pipe(p))

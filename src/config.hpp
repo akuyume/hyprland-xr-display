@@ -9,6 +9,10 @@ struct Config {
               virtual_resolution = "1920x1080", capture_backend = "auto";
   std::string pose_path = "/dev/shm/breezy_desktop_imu",
               drm_device = "/dev/dri/renderD128";
+  std::string stereo_mode = "auto",
+              driver_state_path = "/dev/shm/xr_driver_state";
+  double ipd_mm = 64;
+  std::string view_mode = "desktop";
   double virtual_refresh_rate = 60, virtual_scale = 1, display_distance = 2,
          display_size = 32;
   double horizontal_fov = 40, vertical_fov = 23, yaw_offset = 0,
